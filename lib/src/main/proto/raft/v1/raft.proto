@@ -1,0 +1,81 @@
+syntax = "proto3";
+
+package raft.v1;
+
+option java_multiple_files = true;
+option java_package = "co.hondaya.raft.protocol.v1";
+
+// RaftPeer defines the inter-node RPC contract for core Raft.
+service RaftPeer {
+  // Requests a vote during leader election.
+  rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
+
+  // Replicates log entries and sends leader heartbeats.
+  rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
+}
+
+// RequestVoteRequest is sent by candidates during leader election.
+message RequestVoteRequest {
+  // Candidate's current term.
+  uint64 term = 1;
+
+  // Candidate requesting the vote.
+  string candidate_id = 2;
+
+  // Index of candidate's last log entry.
+  uint64 last_log_index = 3;
+
+  // Term of candidate's last log entry.
+  uint64 last_log_term = 4;
+}
+
+// RequestVoteResponse is returned by voters to candidates.
+message RequestVoteResponse {
+  // Voter's current term, for candidates to update themselves.
+  uint64 term = 1;
+
+  // True means the candidate received this node's vote.
+  bool vote_granted = 2;
+}
+
+// LogEntry carries an opaque client command across the Raft wire protocol.
+message LogEntry {
+  // Raft log index. The first real entry is 1; 0 is the virtual base entry.
+  uint64 index = 1;
+
+  // Term when the leader appended this entry.
+  uint64 term = 2;
+
+  // Application command bytes. Raft does not inspect this payload.
+  bytes command = 3;
+}
+
+// AppendEntriesRequest is sent by leaders for replication and heartbeats.
+message AppendEntriesRequest {
+  // Leader's current term.
+  uint64 term = 1;
+
+  // Leader identity so followers can redirect clients.
+  string leader_id = 2;
+
+  // Index of the log entry immediately before entries.
+  uint64 prev_log_index = 3;
+
+  // Term of the log entry at prev_log_index.
+  uint64 prev_log_term = 4;
+
+  // Log entries to append. Empty for heartbeat messages.
+  repeated LogEntry entries = 5;
+
+  // Leader's commit index.
+  uint64 leader_commit = 6;
+}
+
+// AppendEntriesResponse is returned by followers to leaders.
+message AppendEntriesResponse {
+  // Follower's current term, for leaders to update themselves.
+  uint64 term = 1;
+
+  // True when the follower's log matched prev_log_index/prev_log_term.
+  bool success = 2;
+}

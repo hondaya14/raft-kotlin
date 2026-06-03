@@ -3,8 +3,40 @@
  */
 package org.example
 
+import co.hondaya.raft.protocol.v1.AppendEntriesRequest
+import co.hondaya.raft.protocol.v1.AppendEntriesResponse
+import co.hondaya.raft.protocol.v1.RaftPeer
+import co.hondaya.raft.protocol.v1.RequestVoteRequest
+import co.hondaya.raft.protocol.v1.RequestVoteResponse
+import kotlin.String
+
 class Library {
-    fun someLibraryMethod(): Boolean {
+    suspend fun someLibraryMethod(): Boolean {
+        val node: Node = Node()
+        val req = NodeRequest.of()
+        node.RequestVote(req)
         return true
+    }
+}
+
+
+class Node : RaftPeer {
+    override suspend fun RequestVote(message: RequestVoteRequest): RequestVoteResponse {
+        TODO("Not yet implemented")
+    }
+
+    override suspend fun AppendEntries(message: AppendEntriesRequest): AppendEntriesResponse {
+        TODO("Not yet implemented")
+    }
+}
+
+data class NodeRequest(
+    override val term: ULong,
+    override val candidateId: String,
+    override val lastLogIndex: ULong,
+    override val lastLogTerm: ULong
+) : RequestVoteRequest{
+    companion object {
+        fun of() = NodeRequest(1uL, "", 1uL, 2uL)
     }
 }
