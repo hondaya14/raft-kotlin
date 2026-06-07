@@ -6,7 +6,7 @@ option java_multiple_files = true;
 option java_package = "co.hondaya.raft.protocol.v1";
 
 // RaftPeer defines the inter-node RPC contract for core Raft.
-service RaftPeer {
+service RaftService {
   // Requests a vote during leader election.
   rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
 
