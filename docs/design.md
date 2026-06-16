@@ -4,7 +4,7 @@ This document describes the v1 design for implementing the Raft consensus
 algorithm from the extended Raft paper:
 <https://raft.github.io/raft.pdf>.
 
-The first version focuses on Core Raft: leader election, log replication, safety, 
+The first version focuses on Core Raft: leader election, log replication, safety,
 client command submission, and a stable-storage boundary. Cluster membership changes,
 snapshots, and optimized read-only requests are planned as later extensions.
 
@@ -34,7 +34,7 @@ snapshots, and optimized read-only requests are planned as later extensions.
 - No lease-based reads. Linearizable reads can be modeled as log commands in v1.
 - No runtime-switchable RPC wire format. v1 fixes the wire to Protocol Buffers
   carried by `kotlinx.rpc`. Alternative transports can be added later behind the
-  `RaftPeerClient` abstraction without changing the wire.
+  `RaftService` abstraction without changing the wire.
 
 ## Package Layout
 
@@ -46,7 +46,7 @@ Suggested package boundaries:
   that implement Figure 2 rules. All Raft state (`currentTerm`, `votedFor`,
   `log`, `commitIndex`, `lastApplied`, `nextIndex`, `matchIndex`) lives here.
 - `co.hondaya.raft.storage`: `StableStorage` interface and `InMemoryStableStorage`.
-- `co.hondaya.raft.transport`: `RaftPeerClient` abstraction, `Replicator`
+- `co.hondaya.raft.transport`: `RaftService` abstraction, `Replicator`
   coroutine, and `InMemoryTransport` for tests.
 - `co.hondaya.raft.protocol`: generated Proto messages and core ↔ Proto
   mapping helpers.
@@ -68,7 +68,7 @@ pluggable and which are fixed.
 ┌──────────────────────────────────────────────────────────────┐
 │ Raft loop: log entries store the command as opaque ByteArray │
 └──────────────────────────────────────────────────────────────┘
-                  │  RaftPeerClient             ← (2) transport abstraction
+                  │  RaftService             ← (2) transport abstraction
                   ▼
 ┌──────────────────────────────────────────────────────────────┐
 │ kotlinx.rpc adapter: Proto wire (fixed in v1)                │
@@ -83,20 +83,136 @@ pluggable and which are fixed.
    the log and into `AppendEntries`. Applications choose how to encode (Proto,
    JSON, `kotlinx.serialization`, …). The codec must be deterministic and
    identical across all nodes in the cluster.
-2. **`RaftPeerClient`** — Kotlin interface for "call `RequestVote` /
+2. **`RaftService`** — Kotlin interface for "call `RequestVote` /
    `AppendEntries` on a remote peer". Implementations:
-   - `InMemoryRaftPeerClient` for tests and deterministic simulations.
-   - `KotlinxRpcRaftPeerClient` for production over `kotlinx.rpc`.
-   - Other transports (gRPC direct, HTTP, …) can be added without touching the
-     Raft loop or the Proto schema.
+    - `InMemoryRaftService` for tests and deterministic simulations.
+    - `KotlinxRpcRaftService` for production over `kotlinx.rpc`.
+    - Other transports (gRPC direct, HTTP, …) can be added without touching the
+      Raft loop or the Proto schema.
 3. **Wire format** — fixed in v1 to Protocol Buffers carried by `kotlinx.rpc`.
    This is the only knob v1 intentionally does not expose: there is one
    reference wire to validate safety against before opening it up. A future
    alternative wire would be added as a parallel implementation behind
-   `RaftPeerClient`, not as a runtime switch inside the existing one.
+   `RaftService`, not as a runtime switch inside the existing one.
 
 The Raft loop depends only on (1) and (2). The wire format is an implementation
-detail of one particular `RaftPeerClient`.
+detail of one particular `RaftService`.
+
+## Main Use-Case Diagrams
+
+The diagrams below show the primary v1 flows at the boundary between
+application code, the Raft loop, stable storage, the state machine, and peer
+nodes. They are intentionally implementation-oriented: each message maps to a
+public API call, mailbox event, storage operation, or Raft RPC described later
+in this document.
+
+### Client command submission
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Client
+    participant Node as RaftNode
+    participant Loop as Raft loop
+    participant Storage as StableStorage
+    participant Peers as Peer nodes
+    participant Apply as Apply loop
+    participant SM as StateMachine
+
+    Client->>Node: submit(command)
+    Node->>Loop: ClientSubmit(command)
+    alt node is not leader
+        Loop-->>Node: NotLeader(leaderId)
+        Node-->>Client: SubmitResult.NotLeader
+    else node is leader
+        Loop->>Storage: appendEntries([entry])
+        Storage-->>Loop: persisted
+        Loop->>Peers: AppendEntries(entry)
+        Peers-->>Loop: AppendEntriesResponse(success)
+        Loop->>Loop: advance commitIndex after majority
+        Loop->>Apply: committed range
+        Apply->>SM: apply(decoded command)
+        SM-->>Apply: result
+        Apply-->>Loop: Applied(through = index)
+        Apply-->>Node: complete pending submit
+        Node-->>Client: SubmitResult.Applied
+    end
+```
+
+### Leader election
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Timer as Election timer
+    participant Loop as Raft loop
+    participant Storage as StableStorage
+    participant Peers as Peer nodes
+    participant Repl as Replicators
+
+    Timer->>Loop: ElectionTimeout
+    Loop->>Loop: become CANDIDATE, increment currentTerm, vote for self
+    Loop->>Storage: saveTermAndVote(currentTerm, selfId)
+    Storage-->>Loop: persisted
+    Loop->>Peers: RequestVote(term, lastLogIndex, lastLogTerm)
+    Peers-->>Loop: RequestVoteResponse(voteGranted)
+    alt majority granted
+        Loop->>Loop: become LEADER
+        Loop->>Repl: start one replicator per peer
+        Repl->>Peers: AppendEntries(empty heartbeat)
+    else higher term observed
+        Loop->>Storage: saveTermAndVote(higherTerm, null)
+        Storage-->>Loop: persisted
+        Loop->>Loop: become FOLLOWER
+    end
+```
+
+### Log replication and follower catch-up
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Repl as Leader replicator
+    participant Follower
+    participant Loop as Leader raft loop
+
+    Repl->>Follower: AppendEntries(prevLogIndex, prevLogTerm, entries)
+    alt follower log matches prev entry
+        Follower-->>Repl: success = true
+        Repl-->>Loop: AppendEntriesResponseReceived(success)
+        Loop->>Loop: update matchIndex and nextIndex
+        Loop->>Loop: advance commitIndex if majority replicated
+    else follower log does not match
+        Follower-->>Repl: success = false
+        Repl-->>Loop: AppendEntriesResponseReceived(failure)
+        Loop->>Loop: decrement nextIndex for follower
+        Loop-->>Repl: retry from earlier index
+    end
+```
+
+### Restart and recovery
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Runtime
+    participant Node as RaftNode
+    participant Storage as StableStorage
+    participant Loop as Raft loop
+    participant Timer as Timers
+
+    Runtime->>Node: start()
+    Node->>Storage: load()
+    Storage-->>Node: PersistentState(currentTerm, votedFor, log)
+    Node->>Loop: initialize persistent and volatile state
+    Node->>Timer: start election and heartbeat timers
+    alt no valid leader contacts this node
+        Timer->>Loop: ElectionTimeout
+        Loop->>Loop: start election with recovered term/log
+    else leader sends AppendEntries
+        Loop->>Loop: record leaderId and reconcile log
+    end
+```
 
 ## Gradle Dependencies
 
@@ -186,7 +302,7 @@ must match the `.proto` contract, but the Raft algorithm should call it through 
 small peer client abstraction so tests can use an in-memory implementation.
 
 ```kotlin
-interface RaftPeerClient {
+interface RaftService {
     suspend fun requestVote(target: NodeId, request: RequestVoteRequestProto): RequestVoteResponseProto
     suspend fun appendEntries(target: NodeId, request: AppendEntriesRequestProto): AppendEntriesResponseProto
 }
@@ -233,9 +349,12 @@ interval. Tests use a deterministic scheduler.
 Use small value classes for protocol identifiers and indexes.
 
 ```kotlin
-@JvmInline value class NodeId(val value: String)
-@JvmInline value class Term(val value: Long)
-@JvmInline value class LogIndex(val value: Long)
+@JvmInline
+value class NodeId(val value: String)
+@JvmInline
+value class Term(val value: Long)
+@JvmInline
+value class LogIndex(val value: Long)
 
 data class LogEntry<C : Any>(
     val index: LogIndex,
@@ -262,9 +381,9 @@ Each node has exactly one role:
 
 ```kotlin
 enum class NodeState {
-  FOLLOWER,
-  CANDIDATE,
-  LEADER,
+    FOLLOWER,
+    CANDIDATE,
+    LEADER,
 }
 ```
 
@@ -348,7 +467,7 @@ coroutine per peer. Each Replicator:
 
 - Reads the entries it needs to send from a shared snapshot of the log together
   with the leader's view of `nextIndex[peer]`.
-- Sends `AppendEntries` RPCs via `RaftPeerClient`. Heartbeats are
+- Sends `AppendEntries` RPCs via `RaftService`. Heartbeats are
   zero-entry `AppendEntries` calls (Figure 2 "Leaders" rule: "Upon election:
   send initial empty AppendEntries RPCs (heartbeat) to each server; repeat
   during idle periods to prevent election timeouts").
@@ -456,15 +575,17 @@ for (event in mailbox) {
     event.observedTerm()?.let { incoming -> stepDownIfNewerTerm(incoming) }
 
     when (event) {
-        is AppendEntriesReceived         -> handleAppendEntries(event)
-        is RequestVoteReceived           -> handleRequestVote(event)
+        is AppendEntriesReceived -> handleAppendEntries(event)
+        is RequestVoteReceived -> handleRequestVote(event)
         is AppendEntriesResponseReceived -> handleAppendEntriesResponse(event)
-        is RequestVoteResponseReceived   -> handleRequestVoteResponse(event)
-        ElectionTimeout                  -> startElection()
-        HeartbeatTick                    -> sendHeartbeatsIfLeader()
-        is ClientSubmit<*>               -> handleClientSubmit(event)
-        is Applied                       -> lastApplied = event.through
-        is Stop                          -> { shutdown(); event.reply.complete(Unit); return }
+        is RequestVoteResponseReceived -> handleRequestVoteResponse(event)
+        ElectionTimeout -> startElection()
+        HeartbeatTick -> sendHeartbeatsIfLeader()
+        is ClientSubmit<*> -> handleClientSubmit(event)
+        is Applied -> lastApplied = event.through
+        is Stop -> {
+            shutdown(); event.reply.complete(Unit); return
+        }
     }
 
     // Figure 2 "All Servers" rule (apply commit)
@@ -811,7 +932,7 @@ invariants the tests must check:
 
 ## Testing Strategy
 
-Use `InMemoryStableStorage`, `InMemoryRaftPeerClient`, and a deterministic
+Use `InMemoryStableStorage`, `InMemoryRaftService`, and a deterministic
 `RaftScheduler` for unit and simulation tests. Each layer of the implementation
 maps to a distinct test surface:
 
