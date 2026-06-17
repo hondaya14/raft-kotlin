@@ -359,7 +359,8 @@ value class LogIndex(val value: Long)
 data class LogEntry<C : Any>(
     val index: LogIndex,
     val term: Term,
-    val command: C,
+    val command: C?,
+    val noOp: Boolean = false,
 )
 
 data class ClusterConfig(
@@ -670,6 +671,7 @@ message LogEntry {
   uint64 index = 1;
   uint64 term = 2;
   bytes command = 3;
+  bool no_op = 4;
 }
 
 message AppendEntriesRequest {
@@ -793,7 +795,10 @@ On becoming leader:
 - Have the Replicators send an immediate empty `AppendEntries` (heartbeat).
 - Append and replicate a no-op entry for the new term. This helps the leader
   discover committed entries from previous terms and is required before
-  optimized read-only requests are added.
+  optimized read-only requests are added. In v1 this is marked with
+  `LogEntry.no_op`; command bytes are empty on the wire and the typed log stores
+  `command = null`, so the apply loop skips state-machine execution for that
+  index.
 
 On stepping down (a higher term observed, or losing leadership through any
 other path), the Raft loop cancels all Replicators before processing further

@@ -48,6 +48,9 @@ message LogEntry {
 
   // Application command bytes. Raft does not inspect this payload.
   bytes command = 3;
+
+  // True when this entry is the leader-election no-op entry.
+  bool no_op = 4;
 }
 
 // AppendEntriesRequest is sent by leaders for replication and heartbeats.
