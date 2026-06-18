@@ -42,16 +42,17 @@ Suggested package boundaries:
 
 - `co.hondaya.raft`: public node API (`RaftNode`), value types, and the
   application-facing contracts (`StateMachine`, `CommandCodec`).
-- `co.hondaya.raft.loop`: the Raft loop, its mailbox events, and the handlers
-  that implement Figure 2 rules. All Raft state (`currentTerm`, `votedFor`,
-  `log`, `commitIndex`, `lastApplied`, `nextIndex`, `matchIndex`) lives here.
+- `co.hondaya.raft.loop`: the Raft event loop, its queued events, and the
+  handlers that implement Figure 2 rules. All Raft state (`currentTerm`,
+  `votedFor`, `log`, `commitIndex`, `lastApplied`, `nextIndex`, `matchIndex`)
+  lives here.
 - `co.hondaya.raft.storage`: `StableStorage` interface and `InMemoryStableStorage`.
 - `co.hondaya.raft.transport`: `RaftService` abstraction, `Replicator`
   coroutine, and `InMemoryTransport` for tests.
 - `co.hondaya.raft.protocol`: generated Proto messages and core ↔ Proto
   mapping helpers.
 - `co.hondaya.raft.rpc`: `kotlinx.rpc` `RaftService` definitions and the
-  adapters that forward inbound calls into the Raft loop mailbox.
+  adapters that forward inbound calls into the Raft event queue.
 
 ## Abstraction Boundaries
 
@@ -66,7 +67,7 @@ pluggable and which are fixed.
                   │  CommandCodec<C>            ← (1) user-supplied
                   ▼
 ┌──────────────────────────────────────────────────────────────┐
-│ Raft loop: log entries store the command as opaque ByteArray │
+│ Raft event loop: log entries store command as opaque bytes   │
 └──────────────────────────────────────────────────────────────┘
                   │  RaftService             ← (2) transport abstraction
                   ▼
@@ -78,33 +79,33 @@ pluggable and which are fixed.
               gRPC / in-memory / future transports
 ```
 
-1. **`CommandCodec<C>`** — application domain type ↔ `ByteArray`. The Raft loop
-   never inspects command contents; it only carries the encoded bytes through
-   the log and into `AppendEntries`. Applications choose how to encode (Proto,
-   JSON, `kotlinx.serialization`, …). The codec must be deterministic and
-   identical across all nodes in the cluster.
+1. **`CommandCodec<C>`** — application domain type ↔ `ByteArray`. The Raft
+   event loop never inspects command contents; it only carries the encoded
+   bytes through the log and into `AppendEntries`. Applications choose how to
+   encode (Proto, JSON, `kotlinx.serialization`, …). The codec must be
+   deterministic and identical across all nodes in the cluster.
 2. **`RaftService`** — Kotlin interface for "call `RequestVote` /
    `AppendEntries` on a remote peer". Implementations:
     - `InMemoryRaftService` for tests and deterministic simulations.
     - `KotlinxRpcRaftService` for production over `kotlinx.rpc`.
     - Other transports (gRPC direct, HTTP, …) can be added without touching the
-      Raft loop or the Proto schema.
+      Raft event loop or the Proto schema.
 3. **Wire format** — fixed in v1 to Protocol Buffers carried by `kotlinx.rpc`.
    This is the only knob v1 intentionally does not expose: there is one
    reference wire to validate safety against before opening it up. A future
    alternative wire would be added as a parallel implementation behind
    `RaftService`, not as a runtime switch inside the existing one.
 
-The Raft loop depends only on (1) and (2). The wire format is an implementation
-detail of one particular `RaftService`.
+The Raft event loop depends only on (1) and (2). The wire format is an
+implementation detail of one particular `RaftService`.
 
 ## Main Use-Case Diagrams
 
 The diagrams below show the primary v1 flows at the boundary between
-application code, the Raft loop, stable storage, the state machine, and peer
-nodes. They are intentionally implementation-oriented: each message maps to a
-public API call, mailbox event, storage operation, or Raft RPC described later
-in this document.
+application code, the Raft event loop, stable storage, the state machine, and
+peer nodes. They are intentionally implementation-oriented: each message maps
+to a public API call, queued event, storage operation, or Raft RPC described
+later in this document.
 
 ### Client command submission
 
@@ -113,7 +114,7 @@ sequenceDiagram
     autonumber
     participant Client
     participant Node as RaftNode
-    participant RaftLoop as Raft loop
+    participant RaftLoop as Raft event loop
     participant Storage as StableStorage
     participant Peers as Peer nodes
     participant Apply as Apply loop
@@ -145,7 +146,7 @@ sequenceDiagram
 sequenceDiagram
     autonumber
     participant Timer as Election timer
-    participant RaftLoop as Raft loop
+    participant RaftLoop as Raft event loop
     participant Storage as StableStorage
     participant Peers as Peer nodes
     participant Repl as Replicators
@@ -198,7 +199,7 @@ sequenceDiagram
     participant Runtime
     participant Node as RaftNode
     participant Storage as StableStorage
-    participant RaftLoop as Raft loop
+    participant RaftLoop as Raft event loop
     participant Timer as Timers
 
     Runtime->>Node: start()
@@ -408,26 +409,26 @@ Volatile state on leaders:
 - `matchIndex[peer]`: highest log index known replicated on each follower.
 
 All of the state above is owned by a single coroutine — referred to in this
-document as the **Raft loop** — that lives in `co.hondaya.raft.loop`. RPC
-handlers, timer events, client submissions, RPC responses, and apply-loop
-completions enqueue events into the Raft loop's mailbox; the loop is the only
-code path that reads or writes these fields. This is the JVM-side counterpart of
-the implicit "one server, one decision at a time" assumption of Figure 2: it
-guarantees that a `currentTerm` bump and its `votedFor` reset are observed
-atomically by every rule that reads them.
+document as the **Raft event loop** — that lives in `co.hondaya.raft.loop`. RPC
+handlers, timer events, client submissions, RPC responses, and state-machine
+apply completions enqueue events into the Raft event queue; the loop is the
+only code path that reads or writes these fields. This is the JVM-side
+counterpart of the implicit "one server, one decision at a time" assumption of
+Figure 2: it guarantees that a `currentTerm` bump and its `votedFor` reset are
+observed atomically by every rule that reads them.
 
-The Raft loop is described in detail in "Server Implementation Structure" below.
+The Raft event loop is described in detail in "Server Implementation Structure" below.
 
 ## Server Implementation Structure
 
 The implementation is built around three long-lived coroutines per node. Only
-the Raft loop owns mutable Raft state; the other two are IO workers that take
-strict input from, and send strict feedback to, the Raft loop.
+the Raft event loop owns mutable Raft state; the other two are IO workers that
+take strict input from, and send strict feedback to, the Raft event loop.
 
 ```
                             ┌─────────────────────────┐
    client submit  ──────────▶                         │
-   RPC inbound    ──────────▶      Raft loop          │  ← owns all Raft state
+   RPC inbound    ──────────▶   Raft event loop       │  ← owns all Raft state
    RPC reply      ──────────▶  (single coroutine)     │
    timer events   ──────────▶                         │
                             └────────┬────────────────┘
@@ -435,15 +436,15 @@ strict input from, and send strict feedback to, the Raft loop.
                 ┌────────────────────┼─────────────────────┐
                 ▼                    ▼                     ▼
         ┌──────────────┐    ┌─────────────────┐    ┌──────────────┐
-        │ StableStorage│    │  Replicator(s)  │    │ apply loop   │
+        │ StableStorage│    │  Replicator(s)  │    │ apply worker │
         │ (suspending) │    │ (one per peer,  │    │ (sequential, │
         │              │    │  leader only)   │    │  per node)   │
         └──────────────┘    └─────────────────┘    └──────────────┘
 ```
 
-### Raft loop
+### Raft event loop
 
-A single coroutine consuming a `Channel<RaftEvent>` mailbox. Each iteration:
+A single coroutine consuming `raftEventQueue: Channel<RaftEvent>`. Each iteration:
 
 1. Apply the Figure 2 "All Servers" precondition:
    *"If RPC request or response contains term T > currentTerm: set
@@ -453,13 +454,13 @@ A single coroutine consuming a `Channel<RaftEvent>` mailbox. Each iteration:
 3. Apply the Figure 2 "All Servers" postcondition:
    *"If commitIndex > lastApplied: increment lastApplied, apply log[lastApplied]
    to state machine."* In this implementation that step hands the committed
-   range to the apply loop and waits for an `Applied(through)` event before
+   range to the state-machine apply loop and waits for an `Applied(through)` event before
    bumping `lastApplied`.
 
 Handlers may call suspending `StableStorage` functions. While the loop is
 suspended on disk IO, peer responses and timer ticks continue to arrive in the
-mailbox in arrival order; the loop processes them as soon as the current handler
-returns.
+Raft event queue in arrival order; the loop processes them as soon as the
+current handler returns.
 
 ### Replicator coroutines (leader only)
 
@@ -472,8 +473,8 @@ coroutine per peer. Each Replicator:
   zero-entry `AppendEntries` calls (Figure 2 "Leaders" rule: "Upon election:
   send initial empty AppendEntries RPCs (heartbeat) to each server; repeat
   during idle periods to prevent election timeouts").
-- Posts the resulting `AppendEntriesResponse` back into the Raft loop mailbox
-  as an `AppendEntriesResponseReceived` event. The loop is the only place that
+- Posts the resulting `AppendEntriesResponse` back into the Raft event queue as
+  an `AppendEntriesResponseReceived` event. The loop is the only place that
   updates `nextIndex` / `matchIndex` / `commitIndex`.
 - Receives a cancellation signal when the node steps down. All Replicators are
   cancelled before the loop transitions out of leader state.
@@ -483,23 +484,23 @@ for a follower: send AppendEntries RPC with log entries starting at nextIndex"*
 (Figure 2, Leaders). Per-peer coroutines let one slow follower never block
 replication to the others.
 
-### Apply loop
+### State machine apply loop
 
 A single coroutine, started in `start()` and stopped in `stop()`, drains a
-`Channel<CommittedRange>`. For each range, it iterates `lastApplied + 1 ..
-commitIndex` (the indexes are recomputed from the snapshot it was handed; it does
-not read the loop's mutable state), calls `StateMachine.apply(decode(entry))` in
-order, and:
+`committedEntryQueue: Channel<CommittedEntries>`. For each range, it iterates
+`lastApplied + 1 .. commitIndex` (the indexes are recomputed from the snapshot
+it was handed; it does not read the loop's mutable state), calls
+`StateMachine.apply(decode(entry))` in order, and:
 
 1. Completes the `CompletableDeferred` for any local `submit` waiter at that
    index.
-2. Sends an `Applied(through: LogIndex)` event back to the Raft loop so the loop
-   can advance `lastApplied`.
+2. Sends an `Applied(through: LogIndex)` event back to the Raft event queue so
+   the loop can advance `lastApplied`.
 
-Keeping apply off the Raft loop ensures that a slow state machine cannot stall
-heartbeats, vote handling, or further commit advancement. The serialization
-guarantee Raft requires (commands applied in index order, exactly once per node)
-is preserved by the single apply-loop coroutine.
+Keeping apply off the Raft event loop ensures that a slow state machine cannot
+stall heartbeats, vote handling, or further commit advancement. The
+serialization guarantee Raft requires (commands applied in index order, exactly
+once per node) is preserved by the single state-machine apply coroutine.
 
 ### Election and heartbeat timers
 
@@ -507,8 +508,8 @@ Two tiny coroutines convert wall-clock time into events:
 
 - An election timer that, when no valid `AppendEntries` or granted vote has
   arrived within `RaftScheduler.nextElectionTimeout()`, emits `ElectionTimeout`
-  into the mailbox. The loop resets this timer whenever it processes such an
-  event.
+  into the Raft event queue. The loop resets this timer whenever it processes
+  such an event.
 - A heartbeat ticker that, while this node is leader, emits `HeartbeatTick` once
   every `heartbeatInterval`. The loop turns each tick into a fresh round of
   heartbeats by waking the Replicators.
@@ -516,12 +517,12 @@ Two tiny coroutines convert wall-clock time into events:
 Both timers use `RaftScheduler.delay(…)` so tests can drive them with virtual
 time.
 
-## Raft Loop Events
+## Raft Event Queue
 
-The mailbox alphabet is the union of arrows in Figure 2 plus client submission
-and apply-loop feedback. There is intentionally no aggregating event ("commit
-batch", "ready", etc.); every event corresponds 1:1 to something the paper
-already describes.
+The `RaftEvent` alphabet is the union of arrows in Figure 2 plus client
+submission and state-machine apply feedback. There is intentionally no
+aggregating event ("commit batch", "ready", etc.); every event corresponds 1:1
+to something the paper already describes.
 
 ```kotlin
 sealed interface RaftEvent {
@@ -568,10 +569,10 @@ sealed interface RaftEvent {
 }
 ```
 
-The loop body:
+The Raft event loop body:
 
 ```kotlin
-for (event in mailbox) {
+for (event in raftEventQueue) {
     // Figure 2 "All Servers" rule (term observation)
     event.observedTerm()?.let { incoming -> stepDownIfNewerTerm(incoming) }
 
@@ -708,10 +709,10 @@ The same RPC is used for heartbeats with an empty `entries` list.
 ## Persistence and RPC Response Ordering
 
 Figure 2 annotates the persistent state with: *"(Updated on stable storage
-before responding to RPCs)"*. The Raft loop turns that single sentence into a
-small number of explicit ordering rules. Every handler that mutates persistent
-state must complete its `StableStorage` call **before** the matching reply or
-side effect is released.
+before responding to RPCs)"*. The Raft event loop turns that single sentence
+into a small number of explicit ordering rules. Every handler that mutates
+persistent state must complete its `StableStorage` call **before** the matching
+reply or side effect is released.
 
 1. **Granting a vote.** When `handleRequestVote` decides to grant a vote, it
    updates `currentTerm` / `votedFor`, calls
@@ -737,24 +738,24 @@ side effect is released.
    AppendEntries RPCs in parallel..."*).
 
 These ordering rules are restated as invariants in "Safety Invariants" below
-and are the primary correctness obligation of the Raft loop. Tests must verify
-each one independently.
+and are the primary correctness obligation of the Raft event loop. Tests must
+verify each one independently.
 
 ## Execution Model
 
 `start()` launches the coroutines described in "Server Implementation
 Structure":
 
-- The **Raft loop** itself.
-- The **apply loop** drained by the state machine.
+- The **Raft event loop** itself.
+- The **state-machine apply loop** drained by the state machine.
 - The **election timer** and **heartbeat ticker** that translate `delay(…)`
-  into mailbox events.
-- Per-peer **Replicator** coroutines, started and cancelled by the Raft loop as
-  it enters and leaves leader state.
+  into Raft event queue events.
+- Per-peer **Replicator** coroutines, started and cancelled by the Raft event
+  loop as it enters and leaves leader state.
 
-`stop()` posts a `Stop` event, waits for the Raft loop to drain, cancels timers
-and Replicators, completes any remaining `submit` waiters with `Unavailable`,
-and finally cancels the apply loop.
+`stop()` posts a `Stop` event, waits for the Raft event loop to drain, cancels
+timers and Replicators, completes any remaining `submit` waiters with
+`Unavailable`, and finally cancels the state-machine apply loop.
 
 Election timeout must be substantially larger than heartbeat interval. A
 reasonable default is:
@@ -790,20 +791,20 @@ On becoming leader:
 - Set `matchIndex[peer]` to `0`.
 - Launch one `Replicator(peerId)` coroutine per peer (see "Server Implementation
   Structure"). The Replicators own the actual `AppendEntries` send loop; the
-  Raft loop only updates `nextIndex` / `matchIndex` / `commitIndex` when
+  Raft event loop only updates `nextIndex` / `matchIndex` / `commitIndex` when
   responses come back via `AppendEntriesResponseReceived`.
 - Have the Replicators send an immediate empty `AppendEntries` (heartbeat).
 - Append and replicate a no-op entry for the new term. This helps the leader
   discover committed entries from previous terms and is required before
   optimized read-only requests are added. In v1 this is marked with
   `LogEntry.no_op`; command bytes are empty on the wire and the typed log stores
-  `command = null`, so the apply loop skips state-machine execution for that
-  index.
+  `command = null`, so the state-machine apply loop skips state-machine
+  execution for that index.
 
 On stepping down (a higher term observed, or losing leadership through any
-other path), the Raft loop cancels all Replicators before processing further
-events. No `AppendEntries` may be in-flight from a node that is no longer leader
-by the time it accepts a new `RequestVote`.
+other path), the Raft event loop cancels all Replicators before processing
+further events. No `AppendEntries` may be in-flight from a node that is no
+longer leader by the time it accepts a new `RequestVote`.
 
 ## Log Replication
 
@@ -816,8 +817,8 @@ The leader handles `submit(command)` by:
 3. Notifying the Replicators that there is new work; each peer's coroutine then
    dispatches `AppendEntries` starting from its `nextIndex`.
 4. Registering the caller's `CompletableDeferred` in `pendingSubmits[index]`.
-5. Completing the submit call when the apply loop reports the entry as applied
-   (see "Applying Entries").
+5. Completing the submit call when the state-machine apply loop reports the
+   entry as applied (see "Applying Entries").
 
 On successful follower response:
 
@@ -843,24 +844,24 @@ Older entries become committed indirectly when a current-term entry is committed
 
 ## Applying Entries
 
-Apply runs in the dedicated apply-loop coroutine (see "Server Implementation
-Structure"), not inside the Raft loop. Whenever the Raft loop observes
-`commitIndex > lastApplied` at the end of processing an event, it sends the
-range `(lastApplied + 1 .. commitIndex)` to the apply-loop channel together
-with a snapshot of the relevant log entries.
+Apply runs in the dedicated state-machine apply coroutine (see "Server
+Implementation Structure"), not inside the Raft event loop. Whenever the Raft
+event loop observes `commitIndex > lastApplied` at the end of processing an
+event, it sends the range `(lastApplied + 1 .. commitIndex)` to the committed
+entry queue together with a snapshot of the relevant log entries.
 
-For each entry in the range, the apply loop, in order:
+For each entry in the range, the state-machine apply loop, in order:
 
 1. Calls `stateMachine.apply(decode(entry.command))`.
 2. Completes any `pendingSubmits[index]` deferred with
    `SubmitResult.Applied(index, term, result)`.
-3. Posts `Applied(through = index)` back into the Raft loop mailbox, which
-   bumps `lastApplied` on the next iteration.
+3. Posts `Applied(through = index)` back into the Raft event queue, which bumps
+   `lastApplied` on the next iteration.
 
-Posting `Applied` from the apply loop is how the Raft loop's `lastApplied`
-field stays consistent with the state machine's view of the world. Because all
-mutations of `lastApplied` flow through the same mailbox, the field never goes
-backwards or skips an index.
+Posting `Applied` from the state-machine apply loop is how the Raft event
+loop's `lastApplied` field stays consistent with the state machine's view of
+the world. Because all mutations of `lastApplied` flow through the same Raft
+event queue, the field never goes backwards or skips an index.
 
 If a command originated on a previous leader, applying it still updates the
 state machine but may not have a local submit waiter; `pendingSubmits.remove`
@@ -884,7 +885,7 @@ machine."* The mechanics:
 - The leader's `handleClientSubmit` registers a `CompletableDeferred` in
   `pendingSubmits[index]` once the entry is appended to the log (and persisted,
   per ordering rule 5).
-- The apply loop resolves that deferred when it finishes calling
+- The state-machine apply loop resolves that deferred when it finishes calling
   `stateMachine.apply(...)`.
 - `submit` returns the resolved `SubmitResult.Applied(index, term, result)`.
 
@@ -941,15 +942,15 @@ Use `InMemoryStableStorage`, `InMemoryRaftService`, and a deterministic
 `RaftScheduler` for unit and simulation tests. Each layer of the implementation
 maps to a distinct test surface:
 
-- **Raft loop handlers** — single-node behavior of each Figure 2 rule.
-  Construct a Raft loop, post a single `RaftEvent`, then inspect resulting
+- **Raft event loop handlers** — single-node behavior of each Figure 2 rule.
+  Construct a Raft event loop, post a single `RaftEvent`, then inspect resulting
   state, `StableStorage` calls, and outbound RPCs captured by the in-memory
   transport.
-- **Raft loop + Replicators + apply loop** — single-node end-to-end. Drive
+- **Raft event loop + Replicators + state-machine apply loop** — single-node end-to-end. Drive
   timers through the deterministic scheduler; verify `pendingSubmits` deferreds
   complete in apply order.
 - **Multi-node simulation** — election, replication, partition, recovery. Wire
-  several Raft loops together with a single `InMemoryNetwork` that can inject
+  several Raft event loops together with a single `InMemoryNetwork` that can inject
   drops, delays, and reorderings under a single virtual-time scheduler.
 - **`kotlinx.rpc` adapter** — wire round-trip. Stand up a `RaftService`
   server/client pair on the in-memory `kotlinx.rpc` transport; confirm Proto
@@ -1037,9 +1038,10 @@ The paper is the primary reference; the libraries below are background.
   implementation expresses the same invariants through per-handler ordering
   rules in "Persistence and RPC Response Ordering".
 - **hashicorp/raft** (Go). Owns its own goroutines and channels much like the
-  Raft loop / Replicators / apply loop structure here. Our split into a single
-  loop plus per-peer Replicators and a dedicated apply loop is closest to this
-  shape, but the public API does not adopt their `ApplyFuture` type.
+  Raft event loop / Replicators / state-machine apply loop structure here. Our
+  split into a single event loop plus per-peer Replicators and a dedicated
+  state-machine apply loop is closest to this shape, but the public API does
+  not adopt their `ApplyFuture` type.
 - **tikv/raft-rs** (Rust). The pure-core half of etcd's design, ported to Rust.
   Same comments as for etcd-io/raft.
 

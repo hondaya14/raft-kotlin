@@ -46,12 +46,12 @@ class CoroutineRaftNode<C : Any, R : Any>(
     override val id: NodeId = config.selfId
 
     private val scope = CoroutineScope(SupervisorJob() + coroutineContext)
-    private val mailbox = Channel<RaftEvent<C, R>>(Channel.UNLIMITED)
-    private val applyMailbox = Channel<CommittedRange<C>>(Channel.UNLIMITED)
+    private val raftEventQueue = Channel<RaftEvent<C, R>>(Channel.UNLIMITED)
+    private val committedEntryQueue = Channel<CommittedEntries<C>>(Channel.UNLIMITED)
     private val pendingSubmits = linkedMapOf<LogIndex, CompletableDeferred<SubmitResult<R>>>()
 
-    private var loopJob: Job? = null
-    private var applyJob: Job? = null
+    private var raftEventLoopJob: Job? = null
+    private var stateMachineApplyJob: Job? = null
     private var electionTimerJob: Job? = null
     private var heartbeatJob: Job? = null
     private val replicatorJobs = linkedMapOf<NodeId, Job>()
@@ -80,22 +80,22 @@ class CoroutineRaftNode<C : Any, R : Any>(
         log += persistentState.log.sortedBy { it.index.value }
         statusSnapshot = snapshotStatus()
         started = true
-        applyJob = scope.launch { runApplyLoop() }
-        loopJob = scope.launch { runLoop() }
+        stateMachineApplyJob = scope.launch { runStateMachineApplyLoop() }
+        raftEventLoopJob = scope.launch { runRaftEventLoop() }
         resetElectionTimer()
     }
 
     override suspend fun stop() {
         if (!started) return
         val reply = CompletableDeferred<Unit>()
-        mailbox.send(RaftEvent.Stop(reply))
+        raftEventQueue.send(RaftEvent.Stop(reply))
         reply.await()
     }
 
     override suspend fun submit(command: C): SubmitResult<R> {
         if (!started) return SubmitResult.Unavailable("node is not started")
         val reply = CompletableDeferred<SubmitResult<R>>()
-        mailbox.send(RaftEvent.ClientSubmit(command, reply))
+        raftEventQueue.send(RaftEvent.ClientSubmit(command, reply))
         return reply.await()
     }
 
@@ -103,18 +103,18 @@ class CoroutineRaftNode<C : Any, R : Any>(
 
     override suspend fun requestVote(request: RequestVoteRequest): RequestVoteResponse {
         val reply = CompletableDeferred<RequestVoteResponse>()
-        mailbox.send(RaftEvent.RequestVoteReceived(request, reply))
+        raftEventQueue.send(RaftEvent.RequestVoteReceived(request, reply))
         return reply.await()
     }
 
     override suspend fun appendEntries(request: AppendEntriesRequest): AppendEntriesResponse {
         val reply = CompletableDeferred<AppendEntriesResponse>()
-        mailbox.send(RaftEvent.AppendEntriesReceived(request, reply))
+        raftEventQueue.send(RaftEvent.AppendEntriesReceived(request, reply))
         return reply.await()
     }
 
-    private suspend fun runLoop() {
-        for (event in mailbox) {
+    private suspend fun runRaftEventLoop() {
+        for (event in raftEventQueue) {
             observeTerm(event.observedTerm())
             when (event) {
                 is RaftEvent.AppendEntriesReceived -> handleAppendEntries(event)
@@ -147,7 +147,7 @@ class CoroutineRaftNode<C : Any, R : Any>(
                     return
                 }
             }
-            handOffCommittedEntries()
+            enqueueCommittedEntriesForApply()
             statusSnapshot = snapshotStatus()
         }
     }
@@ -246,7 +246,7 @@ class CoroutineRaftNode<C : Any, R : Any>(
                 val response = withTimeoutOrNull(1.seconds) {
                     service.requestVote(peer, request)
                 } ?: RequestVoteResponse(request.term, false)
-                mailbox.send(RaftEvent.RequestVoteResponseReceived(peer, response.term, response.voteGranted))
+                raftEventQueue.send(RaftEvent.RequestVoteResponseReceived(peer, response.term, response.voteGranted))
             }
         }
     }
@@ -285,7 +285,7 @@ class CoroutineRaftNode<C : Any, R : Any>(
         storage.appendEntries(listOf(entry))
         if (hasMajority(1)) {
             commitIndex = entry.index
-            handOffCommittedEntries()
+            enqueueCommittedEntriesForApply()
         }
     }
 
@@ -310,7 +310,7 @@ class CoroutineRaftNode<C : Any, R : Any>(
 
         if (hasMajority(1)) {
             commitIndex = entry.index
-            handOffCommittedEntries()
+            enqueueCommittedEntriesForApply()
         } else {
             config.peers.forEach { peer -> enqueueAppendEntries(peer) }
         }
@@ -367,32 +367,32 @@ class CoroutineRaftNode<C : Any, R : Any>(
         requests.trySend(request)
     }
 
-    private suspend fun handOffCommittedEntries() {
+    private suspend fun enqueueCommittedEntriesForApply() {
         if (commitIndex <= applyQueuedThrough) return
         val entries = log.filter { it.index > applyQueuedThrough && it.index <= commitIndex }
         if (entries.isNotEmpty()) {
-            applyMailbox.send(CommittedRange(entries))
+            committedEntryQueue.send(CommittedEntries(entries))
             applyQueuedThrough = entries.last().index
         }
     }
 
-    private suspend fun runApplyLoop() {
-        for (range in applyMailbox) {
+    private suspend fun runStateMachineApplyLoop() {
+        for (range in committedEntryQueue) {
             for (entry in range.entries) {
                 try {
                     if (entry.noOp) {
-                        mailbox.send(RaftEvent.Applied<R>(entry.index, entry.term, null))
+                        raftEventQueue.send(RaftEvent.Applied<R>(entry.index, entry.term, null))
                     } else {
                         val result = stateMachine.apply(requireNotNull(entry.command))
-                        mailbox.send(RaftEvent.Applied(entry.index, entry.term, result))
+                        raftEventQueue.send(RaftEvent.Applied(entry.index, entry.term, result))
                     }
                 } catch (error: Throwable) {
-                    mailbox.send(
+                    raftEventQueue.send(
                         RaftEvent.ApplyFailed(
                             "state machine failed: ${error.message ?: error::class.simpleName}",
                         ),
                     )
-                    mailbox.send(RaftEvent.Stop(CompletableDeferred()))
+                    raftEventQueue.send(RaftEvent.Stop(CompletableDeferred()))
                     return
                 }
             }
@@ -420,9 +420,9 @@ class CoroutineRaftNode<C : Any, R : Any>(
         stopReplicators()
         pendingSubmits.values.forEach { it.complete(SubmitResult.Unavailable("node stopped")) }
         pendingSubmits.clear()
-        mailbox.close()
-        applyMailbox.close()
-        listOfNotNull(applyJob).joinAll()
+        raftEventQueue.close()
+        committedEntryQueue.close()
+        listOfNotNull(stateMachineApplyJob).joinAll()
         scope.cancel()
     }
 
@@ -430,7 +430,7 @@ class CoroutineRaftNode<C : Any, R : Any>(
         stopElectionTimer()
         electionTimerJob = scope.launch {
             scheduler.delay(scheduler.nextElectionTimeout())
-            mailbox.send(RaftEvent.ElectionTimeout)
+            raftEventQueue.send(RaftEvent.ElectionTimeout)
         }
     }
 
@@ -444,7 +444,7 @@ class CoroutineRaftNode<C : Any, R : Any>(
         heartbeatJob = scope.launch {
             while (true) {
                 scheduler.delay(config.heartbeatInterval)
-                mailbox.send(RaftEvent.HeartbeatTick)
+                raftEventQueue.send(RaftEvent.HeartbeatTick)
             }
         }
     }
@@ -464,7 +464,7 @@ class CoroutineRaftNode<C : Any, R : Any>(
                     val response = withTimeoutOrNull(1.seconds) {
                         service.appendEntries(peer, request)
                     } ?: AppendEntriesResponse(request.term, false)
-                    mailbox.send(RaftEvent.AppendEntriesResponseReceived(peer, request, response))
+                    raftEventQueue.send(RaftEvent.AppendEntriesResponseReceived(peer, request, response))
                 }
             }
         }
@@ -511,6 +511,6 @@ class CoroutineRaftNode<C : Any, R : Any>(
     )
 }
 
-private data class CommittedRange<C : Any>(
+private data class CommittedEntries<C : Any>(
     val entries: List<LogEntry<C>>,
 )
