@@ -40,8 +40,14 @@ snapshots, and optimized read-only requests are planned as later extensions.
 
 Suggested package boundaries:
 
-- `co.hondaya.raft`: public node API (`RaftNode`), value types, and the
-  application-facing contracts (`StateMachine`, `CommandCodec`).
+- `co.hondaya.raft.node`: node-facing types (`RaftNode`, `SubmitResult`,
+  `RaftStatus`, `NodeState`).
+- `co.hondaya.raft.cluster`: cluster identity and configuration (`NodeId`,
+  `ClusterConfig`).
+- `co.hondaya.raft.log`: log and term value types (`Term`, `LogIndex`,
+  `LogEntry`).
+- `co.hondaya.raft.command`: application command boundary (`StateMachine`,
+  `CommandCodec`).
 - `co.hondaya.raft.loop`: the Raft event loop, its queued events, and the
   handlers that implement Figure 2 rules. All Raft state (`currentTerm`,
   `votedFor`, `log`, `commitIndex`, `lastApplied`, `nextIndex`, `matchIndex`)
@@ -134,7 +140,7 @@ sequenceDiagram
         RaftLoop->>Apply: committed range
         Apply->>SM: apply(decoded command)
         SM-->>Apply: result
-        Apply-->>RaftLoop: Applied(through = index)
+        Apply-->>RaftLoop: Applied(appliedThrough = index)
         Apply-->>Node: complete pending submit
         Node-->>Client: SubmitResult.Applied
     end
@@ -454,7 +460,7 @@ A single coroutine consuming `raftEventQueue: Channel<RaftEvent>`. Each iteratio
 3. Apply the Figure 2 "All Servers" postcondition:
    *"If commitIndex > lastApplied: increment lastApplied, apply log[lastApplied]
    to state machine."* In this implementation that step hands the committed
-   range to the state-machine apply loop and waits for an `Applied(through)` event before
+   range to the state-machine apply loop and waits for an `Applied(appliedThrough)` event before
    bumping `lastApplied`.
 
 Handlers may call suspending `StableStorage` functions. While the loop is
@@ -494,7 +500,7 @@ it was handed; it does not read the loop's mutable state), calls
 
 1. Completes the `CompletableDeferred` for any local `submit` waiter at that
    index.
-2. Sends an `Applied(through: LogIndex)` event back to the Raft event queue so
+2. Sends an `Applied(appliedThrough: LogIndex)` event back to the Raft event queue so
    the loop can advance `lastApplied`.
 
 Keeping apply off the Raft event loop ensures that a slow state machine cannot
@@ -528,27 +534,27 @@ to something the paper already describes.
 sealed interface RaftEvent {
     // AppendEntries RPC (Figure 2: "AppendEntries RPC > Receiver implementation")
     data class AppendEntriesReceived(
-        val req: AppendEntriesRequest,
-        val reply: CompletableDeferred<AppendEntriesResponse>,
+        val rpcRequest: AppendEntriesRequest,
+        val rpcReply: CompletableDeferred<AppendEntriesResponse>,
     ) : RaftEvent
 
     // RequestVote RPC (Figure 2: "RequestVote RPC > Receiver implementation")
     data class RequestVoteReceived(
-        val req: RequestVoteRequest,
-        val reply: CompletableDeferred<RequestVoteResponse>,
+        val rpcRequest: RequestVoteRequest,
+        val rpcReply: CompletableDeferred<RequestVoteResponse>,
     ) : RaftEvent
 
     // Responses to RPCs this node sent out (drive the Leaders / Candidates rules)
     data class AppendEntriesResponseReceived(
-        val from: NodeId,
-        val req: AppendEntriesRequest,
-        val res: AppendEntriesResponse,
+        val respondedBy: NodeId,
+        val sentRequest: AppendEntriesRequest,
+        val rpcResponse: AppendEntriesResponse,
     ) : RaftEvent
 
     data class RequestVoteResponseReceived(
-        val from: NodeId,
-        val term: Term,
-        val voteGranted: Boolean,
+        val respondedBy: NodeId,
+        val responseTerm: Term,
+        val grantedVote: Boolean,
     ) : RaftEvent
 
     // Timer events
@@ -557,15 +563,15 @@ sealed interface RaftEvent {
 
     // Client interaction (Section 8)
     data class ClientSubmit<C>(
-        val command: C,
-        val reply: CompletableDeferred<SubmitResult<*>>,
+        val submittedCommand: C,
+        val submitResult: CompletableDeferred<SubmitResult<*>>,
     ) : RaftEvent
 
     // Apply loop feedback ("All Servers" rule: increment lastApplied)
-    data class Applied(val through: LogIndex) : RaftEvent
+    data class Applied(val appliedThrough: LogIndex) : RaftEvent
 
     // Lifecycle
-    data class Stop(val reply: CompletableDeferred<Unit>) : RaftEvent
+    data class Stop(val stopped: CompletableDeferred<Unit>) : RaftEvent
 }
 ```
 
@@ -584,9 +590,9 @@ for (event in raftEventQueue) {
         ElectionTimeout -> startElection()
         HeartbeatTick -> sendHeartbeatsIfLeader()
         is ClientSubmit<*> -> handleClientSubmit(event)
-        is Applied -> lastApplied = event.through
+        is Applied -> lastApplied = event.appliedThrough
         is Stop -> {
-            shutdown(); event.reply.complete(Unit); return
+            shutdown(); event.stopped.complete(Unit); return
         }
     }
 
@@ -855,7 +861,7 @@ For each entry in the range, the state-machine apply loop, in order:
 1. Calls `stateMachine.apply(decode(entry.command))`.
 2. Completes any `pendingSubmits[index]` deferred with
    `SubmitResult.Applied(index, term, result)`.
-3. Posts `Applied(through = index)` back into the Raft event queue, which bumps
+3. Posts `Applied(appliedThrough = index)` back into the Raft event queue, which bumps
    `lastApplied` on the next iteration.
 
 Posting `Applied` from the state-machine apply loop is how the Raft event

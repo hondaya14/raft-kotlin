@@ -1,4 +1,4 @@
-package co.hondaya.raft
+package co.hondaya.raft.node
 
 enum class NodeState {
     FOLLOWER,

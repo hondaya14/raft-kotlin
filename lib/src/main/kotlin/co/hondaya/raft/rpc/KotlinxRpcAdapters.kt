@@ -1,6 +1,6 @@
 package co.hondaya.raft.rpc
 
-import co.hondaya.raft.NodeId
+import co.hondaya.raft.cluster.NodeId
 import co.hondaya.raft.protocol.toDomain
 import co.hondaya.raft.protocol.toProto
 import co.hondaya.raft.transport.AppendEntriesRequest

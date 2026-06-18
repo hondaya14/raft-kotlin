@@ -1,8 +1,8 @@
 package co.hondaya.raft.protocol
 
-import co.hondaya.raft.LogIndex
-import co.hondaya.raft.NodeId
-import co.hondaya.raft.Term
+import co.hondaya.raft.log.LogIndex
+import co.hondaya.raft.cluster.NodeId
+import co.hondaya.raft.log.Term
 import co.hondaya.raft.protocol.v1.AppendEntriesRequest
 import co.hondaya.raft.protocol.v1.AppendEntriesRequestInternal
 import co.hondaya.raft.protocol.v1.AppendEntriesResponse

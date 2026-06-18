@@ -1,36 +1,15 @@
 package co.hondaya.raft.loop
 
-import co.hondaya.raft.ClusterConfig
-import co.hondaya.raft.CommandCodec
-import co.hondaya.raft.LogEntry
-import co.hondaya.raft.LogIndex
-import co.hondaya.raft.NodeId
-import co.hondaya.raft.NodeState
-import co.hondaya.raft.RaftNode
-import co.hondaya.raft.RaftStatus
-import co.hondaya.raft.StateMachine
-import co.hondaya.raft.SubmitResult
-import co.hondaya.raft.Term
+import co.hondaya.raft.cluster.*
+import co.hondaya.raft.command.*
+import co.hondaya.raft.node.*
+import co.hondaya.raft.log.*
 import co.hondaya.raft.scheduler.DefaultRaftScheduler
 import co.hondaya.raft.scheduler.RaftScheduler
 import co.hondaya.raft.storage.StableStorage
-import co.hondaya.raft.transport.AppendEntriesRequest
-import co.hondaya.raft.transport.AppendEntriesResponse
-import co.hondaya.raft.transport.RaftPeerEndpoint
-import co.hondaya.raft.transport.RaftService
-import co.hondaya.raft.transport.RequestVoteRequest
-import co.hondaya.raft.transport.RequestVoteResponse
-import co.hondaya.raft.transport.WireLogEntry
-import kotlinx.coroutines.CompletableDeferred
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
+import co.hondaya.raft.transport.*
+import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.joinAll
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.coroutines.CoroutineContext
 import kotlin.time.Duration.Companion.seconds
 
@@ -125,25 +104,26 @@ class CoroutineRaftNode<C : Any, R : Any>(
                 is RaftEvent.HeartbeatTick -> sendHeartbeatsIfLeader()
                 is RaftEvent.ClientSubmit<*, *> -> handleClientSubmit(event)
                 is RaftEvent.Applied<*> -> {
-                    if (event.through > lastApplied) {
-                        lastApplied = event.through
+                    if (event.appliedThrough > lastApplied) {
+                        lastApplied = event.appliedThrough
                     }
-                    if (event.result != null) {
-                        @Suppress("UNCHECKED_CAST")
-                        pendingSubmits.remove(event.through)?.complete(
-                            SubmitResult.Applied(event.through, event.term, event.result as R),
+                    if (event.applyResult != null) {
+                        pendingSubmits.remove(event.appliedThrough)?.complete(
+                            SubmitResult.Applied(event.appliedThrough, event.appliedTerm, event.applyResult as R),
                         )
                     }
                 }
+
                 is RaftEvent.ApplyFailed -> {
                     pendingSubmits.values.forEach {
-                        it.complete(SubmitResult.Unavailable(event.reason))
+                        it.complete(SubmitResult.Unavailable(event.failureReason))
                     }
                     pendingSubmits.clear()
                 }
+
                 is RaftEvent.Stop -> {
                     shutdown()
-                    event.reply.complete(Unit)
+                    event.stopped.complete(Unit)
                     return
                 }
             }
@@ -159,9 +139,9 @@ class CoroutineRaftNode<C : Any, R : Any>(
     }
 
     private suspend fun handleRequestVote(event: RaftEvent.RequestVoteReceived) {
-        val request = event.request
+        val request = event.rpcRequest
         if (request.term < currentTerm) {
-            event.reply.complete(RequestVoteResponse(currentTerm, false))
+            event.rpcReply.complete(RequestVoteResponse(currentTerm, false))
             return
         }
 
@@ -174,13 +154,13 @@ class CoroutineRaftNode<C : Any, R : Any>(
             storage.saveTermAndVote(currentTerm, votedFor)
             resetElectionTimer()
         }
-        event.reply.complete(RequestVoteResponse(currentTerm, grantVote))
+        event.rpcReply.complete(RequestVoteResponse(currentTerm, grantVote))
     }
 
     private suspend fun handleAppendEntries(event: RaftEvent.AppendEntriesReceived) {
-        val request = event.request
+        val request = event.rpcRequest
         if (request.term < currentTerm) {
-            event.reply.complete(AppendEntriesResponse(currentTerm, false))
+            event.rpcReply.complete(AppendEntriesResponse(currentTerm, false))
             return
         }
 
@@ -189,7 +169,7 @@ class CoroutineRaftNode<C : Any, R : Any>(
         resetElectionTimer()
 
         if (!hasLogEntry(request.prevLogIndex, request.prevLogTerm)) {
-            event.reply.complete(AppendEntriesResponse(currentTerm, false))
+            event.rpcReply.complete(AppendEntriesResponse(currentTerm, false))
             return
         }
 
@@ -201,7 +181,7 @@ class CoroutineRaftNode<C : Any, R : Any>(
         if (request.leaderCommit > commitIndex) {
             commitIndex = minOf(request.leaderCommit, lastLogIndex())
         }
-        event.reply.complete(AppendEntriesResponse(currentTerm, true))
+        event.rpcReply.complete(AppendEntriesResponse(currentTerm, true))
     }
 
     private suspend fun reconcileFollowerLog(entries: List<LogEntry<C>>) {
@@ -252,9 +232,9 @@ class CoroutineRaftNode<C : Any, R : Any>(
     }
 
     private suspend fun handleRequestVoteResponse(event: RaftEvent.RequestVoteResponseReceived) {
-        if (state != NodeState.CANDIDATE || event.term != currentTerm) return
-        if (event.voteGranted) {
-            votesGranted += event.from
+        if (state != NodeState.CANDIDATE || event.responseTerm != currentTerm) return
+        if (event.grantedVote) {
+            votesGranted += event.respondedBy
             if (hasMajority(votesGranted.size)) {
                 becomeLeader()
             }
@@ -294,18 +274,17 @@ class CoroutineRaftNode<C : Any, R : Any>(
         config.peers.forEach { peer -> enqueueAppendEntries(peer) }
     }
 
-    @Suppress("UNCHECKED_CAST")
     private suspend fun handleClientSubmit(event: RaftEvent.ClientSubmit<*, *>) {
         if (state != NodeState.LEADER) {
-            (event.reply as CompletableDeferred<SubmitResult<R>>).complete(SubmitResult.NotLeader(leaderId))
+            (event.submitResult as CompletableDeferred<SubmitResult<R>>).complete(SubmitResult.NotLeader(leaderId))
             return
         }
 
-        val command = event.command as C
+        val command = event.submittedCommand as C
         val entry = LogEntry(lastLogIndex() + 1, currentTerm, command)
         log += entry
         storage.appendEntries(listOf(entry))
-        val reply = event.reply as CompletableDeferred<SubmitResult<R>>
+        val reply = event.submitResult as CompletableDeferred<SubmitResult<R>>
         pendingSubmits[entry.index] = reply
 
         if (hasMajority(1)) {
@@ -317,12 +296,12 @@ class CoroutineRaftNode<C : Any, R : Any>(
     }
 
     private suspend fun handleAppendEntriesResponse(event: RaftEvent.AppendEntriesResponseReceived) {
-        if (state != NodeState.LEADER || event.request.term != currentTerm || event.response.term != currentTerm) {
+        if (state != NodeState.LEADER || event.sentRequest.term != currentTerm || event.rpcResponse.term != currentTerm) {
             return
         }
-        val peer = event.from
-        if (event.response.success) {
-            val replicatedIndex = event.request.entries.lastOrNull()?.index ?: event.request.prevLogIndex
+        val peer = event.respondedBy
+        if (event.rpcResponse.success) {
+            val replicatedIndex = event.sentRequest.entries.lastOrNull()?.index ?: event.sentRequest.prevLogIndex
             matchIndex[peer] = replicatedIndex
             nextIndex[peer] = replicatedIndex + 1
             advanceCommitIndex()

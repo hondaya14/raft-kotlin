@@ -1,8 +1,8 @@
 package co.hondaya.raft.transport
 
-import co.hondaya.raft.LogIndex
-import co.hondaya.raft.NodeId
-import co.hondaya.raft.Term
+import co.hondaya.raft.log.LogIndex
+import co.hondaya.raft.cluster.NodeId
+import co.hondaya.raft.log.Term
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
