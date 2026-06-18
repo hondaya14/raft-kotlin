@@ -113,27 +113,27 @@ sequenceDiagram
     autonumber
     participant Client
     participant Node as RaftNode
-    participant Loop as Raft loop
+    participant RaftLoop as Raft loop
     participant Storage as StableStorage
     participant Peers as Peer nodes
     participant Apply as Apply loop
     participant SM as StateMachine
 
     Client->>Node: submit(command)
-    Node->>Loop: ClientSubmit(command)
+    Node->>RaftLoop: ClientSubmit(command)
     alt node is not leader
-        Loop-->>Node: NotLeader(leaderId)
+        RaftLoop-->>Node: NotLeader(leaderId)
         Node-->>Client: SubmitResult.NotLeader
     else node is leader
-        Loop->>Storage: appendEntries([entry])
-        Storage-->>Loop: persisted
-        Loop->>Peers: AppendEntries(entry)
-        Peers-->>Loop: AppendEntriesResponse(success)
-        Loop->>Loop: advance commitIndex after majority
-        Loop->>Apply: committed range
+        RaftLoop->>Storage: appendEntries([entry])
+        Storage-->>RaftLoop: persisted
+        RaftLoop->>Peers: AppendEntries(entry)
+        Peers-->>RaftLoop: AppendEntriesResponse(success)
+        RaftLoop->>RaftLoop: advance commitIndex after majority
+        RaftLoop->>Apply: committed range
         Apply->>SM: apply(decoded command)
         SM-->>Apply: result
-        Apply-->>Loop: Applied(through = index)
+        Apply-->>RaftLoop: Applied(through = index)
         Apply-->>Node: complete pending submit
         Node-->>Client: SubmitResult.Applied
     end
@@ -145,25 +145,25 @@ sequenceDiagram
 sequenceDiagram
     autonumber
     participant Timer as Election timer
-    participant Loop as Raft loop
+    participant RaftLoop as Raft loop
     participant Storage as StableStorage
     participant Peers as Peer nodes
     participant Repl as Replicators
 
-    Timer->>Loop: ElectionTimeout
-    Loop->>Loop: become CANDIDATE, increment currentTerm, vote for self
-    Loop->>Storage: saveTermAndVote(currentTerm, selfId)
-    Storage-->>Loop: persisted
-    Loop->>Peers: RequestVote(term, lastLogIndex, lastLogTerm)
-    Peers-->>Loop: RequestVoteResponse(voteGranted)
+    Timer->>RaftLoop: ElectionTimeout
+    RaftLoop->>RaftLoop: become CANDIDATE, increment currentTerm, vote for self
+    RaftLoop->>Storage: saveTermAndVote(currentTerm, selfId)
+    Storage-->>RaftLoop: persisted
+    RaftLoop->>Peers: RequestVote(term, lastLogIndex, lastLogTerm)
+    Peers-->>RaftLoop: RequestVoteResponse(voteGranted)
     alt majority granted
-        Loop->>Loop: become LEADER
-        Loop->>Repl: start one replicator per peer
+        RaftLoop->>RaftLoop: become LEADER
+        RaftLoop->>Repl: start one replicator per peer
         Repl->>Peers: AppendEntries(empty heartbeat)
     else higher term observed
-        Loop->>Storage: saveTermAndVote(higherTerm, null)
-        Storage-->>Loop: persisted
-        Loop->>Loop: become FOLLOWER
+        RaftLoop->>Storage: saveTermAndVote(higherTerm, null)
+        Storage-->>RaftLoop: persisted
+        RaftLoop->>RaftLoop: become FOLLOWER
     end
 ```
 
@@ -174,19 +174,19 @@ sequenceDiagram
     autonumber
     participant Repl as Leader replicator
     participant Follower
-    participant Loop as Leader raft loop
+    participant RaftLoop as Leader raft loop
 
     Repl->>Follower: AppendEntries(prevLogIndex, prevLogTerm, entries)
     alt follower log matches prev entry
         Follower-->>Repl: success = true
-        Repl-->>Loop: AppendEntriesResponseReceived(success)
-        Loop->>Loop: update matchIndex and nextIndex
-        Loop->>Loop: advance commitIndex if majority replicated
+        Repl-->>RaftLoop: AppendEntriesResponseReceived(success)
+        RaftLoop->>RaftLoop: update matchIndex and nextIndex
+        RaftLoop->>RaftLoop: advance commitIndex if majority replicated
     else follower log does not match
         Follower-->>Repl: success = false
-        Repl-->>Loop: AppendEntriesResponseReceived(failure)
-        Loop->>Loop: decrement nextIndex for follower
-        Loop-->>Repl: retry from earlier index
+        Repl-->>RaftLoop: AppendEntriesResponseReceived(failure)
+        RaftLoop->>RaftLoop: decrement nextIndex for follower
+        RaftLoop-->>Repl: retry from earlier index
     end
 ```
 
@@ -198,19 +198,19 @@ sequenceDiagram
     participant Runtime
     participant Node as RaftNode
     participant Storage as StableStorage
-    participant Loop as Raft loop
+    participant RaftLoop as Raft loop
     participant Timer as Timers
 
     Runtime->>Node: start()
     Node->>Storage: load()
     Storage-->>Node: PersistentState(currentTerm, votedFor, log)
-    Node->>Loop: initialize persistent and volatile state
+    Node->>RaftLoop: initialize persistent and volatile state
     Node->>Timer: start election and heartbeat timers
     alt no valid leader contacts this node
-        Timer->>Loop: ElectionTimeout
-        Loop->>Loop: start election with recovered term/log
+        Timer->>RaftLoop: ElectionTimeout
+        RaftLoop->>RaftLoop: start election with recovered term/log
     else leader sends AppendEntries
-        Loop->>Loop: record leaderId and reconcile log
+        RaftLoop->>RaftLoop: record leaderId and reconcile log
     end
 ```
 
