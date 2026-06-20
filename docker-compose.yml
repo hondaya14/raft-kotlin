@@ -1,0 +1,27 @@
+services:
+  raft-node-1:
+    build: .
+    environment:
+      RAFT_NODE_ID: node1
+      RAFT_PORT: 50051
+      RAFT_PEERS: node2=raft-node-2:50051,node3=raft-node-3:50051
+    ports:
+      - "50051:50051"
+
+  raft-node-2:
+    build: .
+    environment:
+      RAFT_NODE_ID: node2
+      RAFT_PORT: 50051
+      RAFT_PEERS: node1=raft-node-1:50051,node3=raft-node-3:50051
+    ports:
+      - "50052:50051"
+
+  raft-node-3:
+    build: .
+    environment:
+      RAFT_NODE_ID: node3
+      RAFT_PORT: 50051
+      RAFT_PEERS: node1=raft-node-1:50051,node2=raft-node-2:50051
+    ports:
+      - "50053:50051"
